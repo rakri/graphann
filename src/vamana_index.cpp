@@ -9,6 +9,7 @@
 #include <numeric>
 #include <random>
 #include <set>
+#include <unordered_map>
 #include <stdexcept>
 #include <cstdlib>
 
@@ -24,38 +25,23 @@ VamanaIndex::~VamanaIndex() {
 }
 
 // ============================================================================
-// Greedy Search
+// Greedy Search (generalized to start from any entry node)
 // ============================================================================
-// Beam search starting from start_node_. Maintains a candidate set of at most
-// L nodes, always expanding the closest unvisited node. Returns when no
-// unvisited candidates remain.
-//
-// Uses std::set<Candidate> as an ordered container — simple, correct, and
-// easy for students to understand and modify.
 
 std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
-VamanaIndex::greedy_search(const float* query, uint32_t L) const {
-    // Candidate set: ordered by (distance, id). Bounded at size L.
+VamanaIndex::greedy_search_from(const float* query, uint32_t L, uint32_t entry_node) const {
     std::set<Candidate> candidate_set;
-    // Track which nodes we've already expanded (visited).
     std::vector<bool> visited(npts_, false);
-
     uint32_t dist_cmps = 0;
 
-    // Seed with start node
-    float start_dist = compute_l2sq(query, get_vector(start_node_), dim_);
+    float start_dist = compute_l2sq(query, get_vector(entry_node), dim_);
     dist_cmps++;
-    candidate_set.insert({start_dist, start_node_});
-    visited[start_node_] = true;
+    candidate_set.insert({start_dist, entry_node});
+    visited[entry_node] = true;
 
-    // Track which candidates have been expanded (their neighbors explored).
-    // We iterate through candidate_set; entries before our "frontier" pointer
-    // have been expanded. We use a simple approach: keep scanning from the
-    // beginning of the set for the first un-expanded entry.
     std::set<uint32_t> expanded;
 
     while (true) {
-        // Find closest candidate that hasn't been expanded yet
         uint32_t best_node = UINT32_MAX;
         for (const auto& [dist, id] : candidate_set) {
             if (expanded.find(id) == expanded.end()) {
@@ -64,13 +50,10 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
             }
         }
         if (best_node == UINT32_MAX)
-            break;  // all candidates expanded
+            break;
 
         expanded.insert(best_node);
 
-        // Expand: evaluate all neighbors of best_node
-        // Copy neighbor list under lock to avoid data race with parallel build
-        // (another thread might push_back / reallocate graph_[best_node]).
         std::vector<uint32_t> neighbors;
         {
             std::lock_guard<std::mutex> lock(locks_[best_node]);
@@ -84,7 +67,6 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
             float d = compute_l2sq(query, get_vector(nbr), dim_);
             dist_cmps++;
 
-            // Insert if candidate set isn't full or this is closer than worst
             if (candidate_set.size() < L) {
                 candidate_set.insert({d, nbr});
             } else {
@@ -97,33 +79,95 @@ VamanaIndex::greedy_search(const float* query, uint32_t L) const {
         }
     }
 
-    // Convert to sorted vector
     std::vector<Candidate> results(candidate_set.begin(), candidate_set.end());
     return {results, dist_cmps};
+}
+
+// Original greedy_search delegates to greedy_search_from
+std::pair<std::vector<VamanaIndex::Candidate>, uint32_t>
+VamanaIndex::greedy_search(const float* query, uint32_t L) const {
+    return greedy_search_from(query, L, start_node_);
+}
+
+// ============================================================================
+// Greedy Search with Shared State (inject new entry into existing search)
+// ============================================================================
+
+uint32_t VamanaIndex::greedy_search_inject(const float* query, uint32_t L,
+                                            uint32_t entry_node,
+                                            std::set<Candidate>& candidate_set,
+                                            std::vector<bool>& visited,
+                                            std::set<uint32_t>& expanded) const {
+    uint32_t dist_cmps = 0;
+
+    if (!visited[entry_node]) {
+        visited[entry_node] = true;
+        float d = compute_l2sq(query, get_vector(entry_node), dim_);
+        dist_cmps++;
+
+        if (candidate_set.size() < L) {
+            candidate_set.insert({d, entry_node});
+        } else {
+            auto worst = std::prev(candidate_set.end());
+            if (d < worst->first) {
+                candidate_set.erase(worst);
+                candidate_set.insert({d, entry_node});
+            }
+        }
+    }
+
+    while (true) {
+        uint32_t best_node = UINT32_MAX;
+        for (const auto& [dist, id] : candidate_set) {
+            if (expanded.find(id) == expanded.end()) {
+                best_node = id;
+                break;
+            }
+        }
+        if (best_node == UINT32_MAX)
+            break;
+
+        expanded.insert(best_node);
+
+        std::vector<uint32_t> neighbors;
+        {
+            std::lock_guard<std::mutex> lock(locks_[best_node]);
+            neighbors = graph_[best_node];
+        }
+        for (uint32_t nbr : neighbors) {
+            if (visited[nbr])
+                continue;
+            visited[nbr] = true;
+
+            float d = compute_l2sq(query, get_vector(nbr), dim_);
+            dist_cmps++;
+
+            if (candidate_set.size() < L) {
+                candidate_set.insert({d, nbr});
+            } else {
+                auto worst = std::prev(candidate_set.end());
+                if (d < worst->first) {
+                    candidate_set.erase(worst);
+                    candidate_set.insert({d, nbr});
+                }
+            }
+        }
+    }
+
+    return dist_cmps;
 }
 
 // ============================================================================
 // Robust Prune (Alpha-RNG Rule)
 // ============================================================================
-// Given a node and a set of candidates, greedily select neighbors that are
-// "diverse" — a candidate c is added only if it's not too close to any
-// already-selected neighbor (within a factor of alpha).
-//
-// Formally: add c if for ALL already-chosen neighbors n:
-//     dist(node, c) <= alpha * dist(c, n)
-//
-// This ensures good graph navigability by keeping some long-range edges
-// (alpha > 1 makes it easier for a candidate to survive pruning).
 
 void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates,
                                float alpha, uint32_t R) {
-    // Remove self from candidates if present
     candidates.erase(
         std::remove_if(candidates.begin(), candidates.end(),
                        [node](const Candidate& c) { return c.second == node; }),
         candidates.end());
 
-    // Sort by distance to node (ascending)
     std::sort(candidates.begin(), candidates.end());
 
     std::vector<uint32_t> new_neighbors;
@@ -133,7 +177,6 @@ void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates
         if (new_neighbors.size() >= R)
             break;
 
-        // Check alpha-RNG condition against all already-selected neighbors
         bool keep = true;
         for (uint32_t selected : new_neighbors) {
             float dist_cand_to_selected =
@@ -157,7 +200,6 @@ void VamanaIndex::robust_prune(uint32_t node, std::vector<Candidate>& candidates
 
 void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
                         float alpha, float gamma) {
-    // --- Load data ---
     std::cout << "Loading data from " << data_path << "..." << std::endl;
     FloatMatrix mat = load_fbin(data_path);
     npts_ = mat.npts;
@@ -173,21 +215,17 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
         L = R;
     }
 
-    // --- Initialize empty graph and per-node locks ---
     graph_.resize(npts_);
     locks_ = std::vector<std::mutex>(npts_);
 
-    // --- Pick random start node ---
-    std::mt19937 rng(42);  // fixed seed for reproducibility
+    std::mt19937 rng(42);
     start_node_ = rng() % npts_;
     std::cout << "  Start node: " << start_node_ << std::endl;
 
-    // --- Create random insertion order ---
     std::vector<uint32_t> perm(npts_);
     std::iota(perm.begin(), perm.end(), 0);
     std::shuffle(perm.begin(), perm.end(), rng);
 
-    // --- Build graph: parallel insertion with per-node locking ---
     uint32_t gamma_R = static_cast<uint32_t>(gamma * R);
     std::cout << "Building index (R=" << R << ", L=" << L
               << ", alpha=" << alpha << ", gamma=" << gamma
@@ -198,25 +236,13 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
     #pragma omp parallel for schedule(dynamic, 64)
     for (size_t idx = 0; idx < npts_; idx++) {
         uint32_t point = perm[idx];
-
-        // Step 1: Search for this point in the current graph to find candidates
         auto [candidates, _dist_cmps] = greedy_search(get_vector(point), L);
-
-        // Step 2: Prune candidates to get this point's neighbors
-        // We don't need to lock graph_[point] here because each point appears
-        // exactly once in the permutation — only this thread writes to it now.
         robust_prune(point, candidates, alpha, R);
 
-        // Step 3: Add backward edges from each new neighbor back to this point
         for (uint32_t nbr : graph_[point]) {
             std::lock_guard<std::mutex> lock(locks_[nbr]);
-
-            // Add backward edge
             graph_[nbr].push_back(point);
-
-            // Step 4: If neighbor's degree exceeds gamma*R, prune its neighborhood
             if (graph_[nbr].size() > gamma_R) {
-                // Build candidate list from current neighbors of nbr
                 std::vector<Candidate> nbr_candidates;
                 nbr_candidates.reserve(graph_[nbr].size());
                 for (uint32_t nn : graph_[nbr]) {
@@ -227,47 +253,167 @@ void VamanaIndex::build(const std::string& data_path, uint32_t R, uint32_t L,
             }
         }
 
-        // Progress reporting (from one thread only)
         if (idx % 10000 == 0) {
             #pragma omp critical
-            {
-                std::cout << "\r  Inserted " << idx << " / " << npts_
-                          << " points" << std::flush;
-            }
+            std::cout << "\r  Inserted " << idx << " / " << npts_
+                      << " points" << std::flush;
         }
     }
 
     double build_time = build_timer.elapsed_seconds();
-
-    // Compute average degree
     size_t total_edges = 0;
     for (uint32_t i = 0; i < npts_; i++)
         total_edges += graph_[i].size();
-    double avg_degree = (double)total_edges / npts_;
 
-    std::cout << "\n  Build complete in " << build_time << " seconds."
-              << std::endl;
-    std::cout << "  Average out-degree: " << avg_degree << std::endl;
+    std::cout << "\n  Build complete in " << build_time << " seconds." << std::endl;
+    std::cout << "  Average out-degree: " << (double)total_edges / npts_ << std::endl;
 }
 
 // ============================================================================
-// Search
+// Search — Standard (single start)
 // ============================================================================
 
 SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L) const {
     if (L < K) L = K;
-
     Timer t;
     auto [candidates, dist_cmps] = greedy_search(query, L);
     double latency = t.elapsed_us();
 
-    // Return top-K results
     SearchResult result;
     result.dist_cmps = dist_cmps;
     result.latency_us = latency;
     result.ids.reserve(K);
-    for (uint32_t i = 0; i < K && i < candidates.size(); i++) {
+    for (uint32_t i = 0; i < K && i < candidates.size(); i++)
         result.ids.push_back(candidates[i].second);
+    return result;
+}
+
+// ============================================================================
+// Search — Multi-Probe V1 (split budget)
+// ============================================================================
+
+SearchResult VamanaIndex::search_multiprobe_split(const float* query, uint32_t K, uint32_t L,
+                                                   uint32_t num_probes, uint32_t seed) const {
+    if (L < K) L = K;
+    if (num_probes < 1) num_probes = 1;
+    Timer t;
+
+    uint32_t L_per_probe = (L + num_probes - 1) / num_probes;
+    if (L_per_probe < K) L_per_probe = K;
+
+    std::mt19937 rng(seed);
+    std::vector<uint32_t> entry_points(num_probes);
+    entry_points[0] = start_node_;
+    for (uint32_t i = 1; i < num_probes; i++)
+        entry_points[i] = rng() % npts_;
+
+    std::unordered_map<uint32_t, float> merged;
+    merged.reserve(L);
+    uint32_t total_dist_cmps = 0;
+
+    for (uint32_t p = 0; p < num_probes; p++) {
+        auto [candidates, cmps] = greedy_search_from(query, L_per_probe, entry_points[p]);
+        total_dist_cmps += cmps;
+        for (const auto& [dist, id] : candidates)
+            merged.emplace(id, dist);
+    }
+
+    std::vector<Candidate> all;
+    all.reserve(merged.size());
+    for (const auto& [id, dist] : merged)
+        all.push_back({dist, id});
+    std::sort(all.begin(), all.end());
+
+    double latency = t.elapsed_us();
+    SearchResult result;
+    result.dist_cmps = total_dist_cmps;
+    result.latency_us = latency;
+    result.ids.reserve(K);
+    for (uint32_t i = 0; i < K && i < all.size(); i++)
+        result.ids.push_back(all[i].second);
+    return result;
+}
+
+// ============================================================================
+// Search — Multi-Probe V2 (full budget per probe)
+// ============================================================================
+
+SearchResult VamanaIndex::search_multiprobe_full(const float* query, uint32_t K, uint32_t L,
+                                                  uint32_t num_probes, uint32_t seed) const {
+    if (L < K) L = K;
+    if (num_probes < 1) num_probes = 1;
+    Timer t;
+
+    std::mt19937 rng(seed);
+    std::vector<uint32_t> entry_points(num_probes);
+    entry_points[0] = start_node_;
+    for (uint32_t i = 1; i < num_probes; i++)
+        entry_points[i] = rng() % npts_;
+
+    std::unordered_map<uint32_t, float> merged;
+    merged.reserve(L * num_probes);
+    uint32_t total_dist_cmps = 0;
+
+    for (uint32_t p = 0; p < num_probes; p++) {
+        auto [candidates, cmps] = greedy_search_from(query, L, entry_points[p]);
+        total_dist_cmps += cmps;
+        for (const auto& [dist, id] : candidates)
+            merged.emplace(id, dist);
+    }
+
+    std::vector<Candidate> all;
+    all.reserve(merged.size());
+    for (const auto& [id, dist] : merged)
+        all.push_back({dist, id});
+    std::sort(all.begin(), all.end());
+
+    double latency = t.elapsed_us();
+    SearchResult result;
+    result.dist_cmps = total_dist_cmps;
+    result.latency_us = latency;
+    result.ids.reserve(K);
+    for (uint32_t i = 0; i < K && i < all.size(); i++)
+        result.ids.push_back(all[i].second);
+    return result;
+}
+
+// ============================================================================
+// Search — Multi-Probe V3 (shared state — best variant)
+// ============================================================================
+
+SearchResult VamanaIndex::search_multiprobe_shared(const float* query, uint32_t K, uint32_t L,
+                                                    uint32_t num_probes, uint32_t seed) const {
+    if (L < K) L = K;
+    if (num_probes < 1) num_probes = 1;
+    Timer t;
+
+    std::mt19937 rng(seed);
+    std::vector<uint32_t> entry_points(num_probes);
+    entry_points[0] = start_node_;
+    for (uint32_t i = 1; i < num_probes; i++)
+        entry_points[i] = rng() % npts_;
+
+    std::set<Candidate> candidate_set;
+    std::vector<bool> visited(npts_, false);
+    std::set<uint32_t> expanded;
+    uint32_t total_dist_cmps = 0;
+
+    for (uint32_t p = 0; p < num_probes; p++) {
+        uint32_t cmps = greedy_search_inject(query, L, entry_points[p],
+                                              candidate_set, visited, expanded);
+        total_dist_cmps += cmps;
+    }
+
+    double latency = t.elapsed_us();
+    SearchResult result;
+    result.dist_cmps = total_dist_cmps;
+    result.latency_us = latency;
+    result.ids.reserve(K);
+    uint32_t count = 0;
+    for (const auto& [dist, id] : candidate_set) {
+        if (count >= K) break;
+        result.ids.push_back(id);
+        count++;
     }
     return result;
 }
@@ -275,13 +421,6 @@ SearchResult VamanaIndex::search(const float* query, uint32_t K, uint32_t L) con
 // ============================================================================
 // Save / Load
 // ============================================================================
-// Binary format:
-//   [uint32] npts
-//   [uint32] dim
-//   [uint32] start_node
-//   For each node i in [0, npts):
-//     [uint32] degree
-//     [uint32 * degree] neighbor IDs
 
 void VamanaIndex::save(const std::string& path) const {
     std::ofstream out(path, std::ios::binary);
@@ -295,25 +434,20 @@ void VamanaIndex::save(const std::string& path) const {
     for (uint32_t i = 0; i < npts_; i++) {
         uint32_t deg = graph_[i].size();
         out.write(reinterpret_cast<const char*>(&deg), 4);
-        if (deg > 0) {
+        if (deg > 0)
             out.write(reinterpret_cast<const char*>(graph_[i].data()),
                       deg * sizeof(uint32_t));
-        }
     }
-
     std::cout << "Index saved to " << path << std::endl;
 }
 
-void VamanaIndex::load(const std::string& index_path,
-                       const std::string& data_path) {
-    // Load data vectors
+void VamanaIndex::load(const std::string& index_path, const std::string& data_path) {
     FloatMatrix mat = load_fbin(data_path);
     npts_ = mat.npts;
     dim_  = mat.dims;
     data_ = mat.data.release();
     owns_data_ = true;
 
-    // Load graph
     std::ifstream in(index_path, std::ios::binary);
     if (!in.is_open())
         throw std::runtime_error("Cannot open index file: " + index_path);
@@ -324,10 +458,7 @@ void VamanaIndex::load(const std::string& index_path,
     in.read(reinterpret_cast<char*>(&start_node_), 4);
 
     if (file_npts != npts_ || file_dim != dim_)
-        throw std::runtime_error(
-            "Index/data mismatch: index has " + std::to_string(file_npts) +
-            "x" + std::to_string(file_dim) + ", data has " +
-            std::to_string(npts_) + "x" + std::to_string(dim_));
+        throw std::runtime_error("Index/data mismatch");
 
     graph_.resize(npts_);
     locks_ = std::vector<std::mutex>(npts_);
@@ -336,12 +467,9 @@ void VamanaIndex::load(const std::string& index_path,
         uint32_t deg;
         in.read(reinterpret_cast<char*>(&deg), 4);
         graph_[i].resize(deg);
-        if (deg > 0) {
-            in.read(reinterpret_cast<char*>(graph_[i].data()),
-                    deg * sizeof(uint32_t));
-        }
+        if (deg > 0)
+            in.read(reinterpret_cast<char*>(graph_[i].data()), deg * sizeof(uint32_t));
     }
-
     std::cout << "Index loaded: " << npts_ << " points, " << dim_
               << " dims, start=" << start_node_ << std::endl;
 }
