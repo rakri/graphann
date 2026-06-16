@@ -175,3 +175,80 @@ Output:
 
 - Subramanya et al., *DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node*, NeurIPS 2019
 
+---
+
+## Multi-Probe Search Extension
+
+This fork investigates whether the fixed entry point in Vamana search is a performance bottleneck, by implementing and evaluating multi-probe search strategies.
+
+### What's New
+
+Three multi-probe search variants added to the codebase:
+
+| Variant | Flag | Description |
+|---------|------|-------------|
+| Split Budget | `--mode split` | k independent searches, each with L/k search list |
+| Full Budget | `--mode full` | k independent searches, each with full L |
+| **Shared State** | `--mode shared` | k probes into one shared candidate set — no redundant work |
+
+New CLI flags for `search_index`:
+```
+--probes 1,2,3,5        # number of entry points per query
+--mode shared            # split | full | shared
+```
+
+### Quick Example
+
+```bash
+# Build
+mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j && cd ..
+
+# Standard search (baseline)
+./build/search_index --index idx.bin --data base.fbin --queries q.fbin --gt gt.ibin \
+    --K 10 --L 10,50,100 --probes 1
+
+# Multi-probe search (5 probes, shared state)
+./build/search_index --index idx.bin --data base.fbin --queries q.fbin --gt gt.ibin \
+    --K 10 --L 10,50,100 --probes 1,2,3,5 --mode shared
+```
+
+### Run Full SIFT1M Experiments
+
+```bash
+./scripts/run_experiments.sh
+```
+
+Downloads SIFT1M, builds 3 indices (R=32, R=64, α=1.4), runs 7 experiments, saves results to `results/`.
+
+### Key Findings
+
+| Configuration | Recall@10 | Dist Cmps | Takeaway |
+|--------------|-----------|-----------|----------|
+| Baseline, L=20 | 0.893 | 883 | Cheapest way to this recall |
+| 5 probes, L=10 | 0.894 | 3,189 | Same recall, 3.6× more expensive |
+| R=64, 1 probe, L=10 | 0.866 | 988 | Better graph > more probes |
+| R=64, 1 probe, L=50 | 0.990 | 2,391 | Build quality dominates |
+
+**Conclusion:** Multi-probe improves recall (+15% at low L) but is not cost-effective. The α-RNG pruning already solves entry point navigability. Invest compute in graph construction (higher R, higher α), not search-time probing.
+
+### Files Changed
+
+```
+include/vamana_index.h     — 3 new search method declarations
+src/vamana_index.cpp       — ~200 lines: greedy_search_from, greedy_search_inject,
+                              search_multiprobe_split, _full, _shared
+src/search_index.cpp       — --probes and --mode CLI flags
+```
+
+### Files Added
+
+```
+scripts/run_experiments.sh       — full SIFT1M automation
+scripts/generate_test_data.py    — synthetic dataset generator
+results/                         — experiment logs
+docs/                            — report and plots
+EXPERIMENTS.md                   — detailed methodology and results
+```
+
+See [EXPERIMENTS.md](EXPERIMENTS.md) for full methodology and results tables.
+

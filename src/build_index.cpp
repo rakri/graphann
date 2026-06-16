@@ -17,14 +17,12 @@ static void print_usage(const char* prog) {
 }
 
 int main(int argc, char** argv) {
-    // Defaults
     std::string data_path, output_path;
     uint32_t R = 32;
     uint32_t L = 75;
     float alpha = 1.2f;
     float gamma = 1.5f;
 
-    // Parse arguments
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--data" && i + 1 < argc)       data_path = argv[++i];

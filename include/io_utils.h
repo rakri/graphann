@@ -3,6 +3,19 @@
 #include <cstdint>
 #include <string>
 #include <memory>
+#include <cstdlib>
+
+#ifdef _MSC_VER
+#include <malloc.h>
+#endif
+
+inline void aligned_free(void* ptr) {
+#ifdef _MSC_VER
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
 
 // Reads a .fbin file: 4 bytes npts (uint32), 4 bytes dims (uint32),
 // then npts * dims floats in row-major order.
@@ -13,7 +26,7 @@ struct FloatMatrix {
     uint32_t npts;
     uint32_t dims;
 
-    FloatMatrix() : data(nullptr, std::free), npts(0), dims(0) {}
+    FloatMatrix() : data(nullptr, aligned_free), npts(0), dims(0) {}
 
     const float* row(uint32_t i) const { return data.get() + (size_t)i * dims; }
     float*       row(uint32_t i)       { return data.get() + (size_t)i * dims; }
@@ -26,7 +39,7 @@ struct IntMatrix {
     uint32_t npts;
     uint32_t dims;
 
-    IntMatrix() : data(nullptr, std::free), npts(0), dims(0) {}
+    IntMatrix() : data(nullptr, aligned_free), npts(0), dims(0) {}
 
     const uint32_t* row(uint32_t i) const { return data.get() + (size_t)i * dims; }
     uint32_t*       row(uint32_t i)       { return data.get() + (size_t)i * dims; }
